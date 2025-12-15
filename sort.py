@@ -1,3 +1,4 @@
+from scipy.optimize import linear_sum_assignment
 from filterpy.kalman import KalmanFilter
 import numpy as np
 
@@ -38,7 +39,7 @@ def iou_calculation(boxA, boxB):  # claculate bboxes overlapping.
 # --------------TRACKER CLASS--------------------------------------------------------------------------------------------------------
 
 
-class tracker:  # holds the prediction phase(kalman filter, predict, update)
+class Tracker:  # holds the prediction phase(kalman filter, predict, update)
     count = 0  # global ID counter
 
     # kalman filter contains 2 main steps: 1. predection, 2. updating.
@@ -102,8 +103,8 @@ class tracker:  # holds the prediction phase(kalman filter, predict, update)
         self.kf.Q[4:, 4:] *= 0.01  # Velocities are stable
 
         # step4: tracking metadata
-        self.id = tracker.count  # give each object a unique ID.
-        tracker.count += 1  # give next object the next ID.
+        self.id = Tracker.count  # give each object a unique ID.
+        Tracker.count += 1  # give next object the next ID.
         self.time_since_update = (
             0  # number of frames since last successful update(last seen of the object).
         )
@@ -118,8 +119,39 @@ class tracker:  # holds the prediction phase(kalman filter, predict, update)
         # the hits doesn't increment.
         # time since update increment by one.
 
+        if self.time_since_update > 0:
+            self.hit_streak = 0
+
         self.time_since_update += 1
-        self.hit_streak = 0
+        return self.get_state()
+
+    def get_state(self):
+        """
+        this function does the following:
+        # Translate the Kalman filter state-space representation(convert [u,v,s,r] back to [x1,y1,x2,y2]).
+        # into a drawable and comparable bounding box in image space.
+
+        """
+        u, v, s, r = self.kf.x[:4].flatten()
+
+        # if the state is bad, force the area to a tiny positive number.
+        if s <= 0:
+            s = 1e-4
+
+            # update the kalman state with the constrained value to maintain stabelity.
+            self.kf.x[2, 0] = s
+
+        # Reverse the conversion
+        w = np.sqrt(s * r)  # width from area and ratio
+        h = s / w  # height from area and width
+
+        # Calculate corners from center
+        x1 = u - w / 2
+        y1 = v - h / 2
+        x2 = u + w / 2
+        y2 = v + h / 2
+
+        return np.array([x1, y1, x2, y2])
 
     def update(self, bbox):
         # an object is detected, what happenes?
@@ -151,132 +183,201 @@ class tracker:  # holds the prediction phase(kalman filter, predict, update)
 # --------------TRACKER MANAGER CLASS--------------------------------------------------------------------------------------------------------
 
 
+class TrackerManager:
+    def __init__(self, max_age=1, min_hits=3, iou_threshold=0.3):
+        # tracks manager initialization
+        self.tracks = []  # this holds an empty list of tracks.
+        self.max_age = max_age
+        self.min_hits = min_hits
+        self.iou_threshold = iou_threshold
+
+    def update(self, detections):
+        """
+        tracker manager loop:
+        1- predict all existing tracks.
+        2- compute cost matrix.
+        3- data association(Hungarian Algorithm).
+        4- update matched tracks.
+        5- handle unmatched tracks.
+        6- craete new tracks for unmatched detections.
+        7- delete bad tracks.
+        8- output confirmed tracks.
+        """
+
+        # 1- predict all existing tracks:
+        predictions = []
+        for t in self.tracks:
+            t.predict()  # Advance the Kalman filter one time step and get the predicted bounding box
+            predictions.append(
+                t.get_state()
+            )  # Save the predicted bounding box for later use(IOU computation, cost matrix, data association)
+
+        # 2- compare cost matrix:
+        # first calulate the iou matrix:
+        iou_matrix = np.zeros((len(predictions), len(detections)))
+        for i, pred in enumerate(predictions):
+            for j, det in enumerate(detections):
+                iou_matrix[i, j] = iou_calculation(pred, det)
+        # calculate the cost matrix(just flipping the iou matrix, because iou maxamize numbers, and hungarian minimize numbers).
+        cost_matrix = 1 - iou_matrix
+
+        # 3- data association(Hungarian Algorithm).
+        row_idx, col_idx = linear_sum_assignment(
+            cost_matrix
+        )  # calling the hungarian algorithm on cost_matrix(this matches everything, even bad matches, so we need to filter them).
+        """
+         Now must answer three questions:
+            which matches are good enough? (IOU threshold)
+            which tracks got no detection?
+            which detections are new objects?
+        """
+        # calculating IOU threshold to filter bad matches:
+        iou_threshold = (
+            self.iou_threshold
+        )  # basically because IOU below ~0.3 is usually bullshit, reject weak overlaps; allow noisy but plausible matches
+
+        matches = []
+        unmatched_tracks = set(
+            range(len(self.tracks))
+        )  # create a set containing the indices of all tracks.
+        unmatched_detections = set(
+            range(len(detections))
+        )  # create a set containing the indices of all detections.
+
+        for r, c in zip(row_idx, col_idx):
+            if iou_matrix[r, c] >= self.iou_threshold:
+                matches.append((r, c))
+                unmatched_tracks.remove(r)  # track index
+                unmatched_detections.remove(c)  # detection index
+
+        # 4- update matched tracks:
+        """
+        Loop over confirmed pairs from Hungarian + IOU filtering
+            For each pair:
+            Take one track
+            Feed it one detection
+            Call update() → Kalman filter correction + bookkeeping
+            (this is preventing deletion in step 7).
+        """
+        for track_idx, det_idx in matches:
+            self.tracks[track_idx].update(detections[det_idx])
+
+        # 5- handle unmatched tracks:
+        """
+        Meaning:
+        These are tracks that did not get any detection matched to them this frame.
+
+        What we do to unmatched tracks?
+        we do almost nothing. On purpose.
+        we do NOT update them with a detection
+        we let the Kalman prediction stand
+        we increment time_since_update (already happened in predict())
+
+        Why this step exists at all?
+        because objects:
+        get occluded
+        miss detections
+        blink out for a frame or two
+        """
+
+        # 6- create new tracks for unmatched detections:
+        # any detection that wasn't matched to an existing track must become a new track.
+        for det_idx in unmatched_detections:
+            new_track = Tracker(detections[det_idx])
+            self.tracks.append(new_track)
+
+        # 7- deletion of tracks logic:
+        # too many misses(time_since_update > max_age).
+        # not enough confirmations(age <= min_hits).
+        self.tracks = [t for t in self.tracks if t.time_since_update <= self.max_age]
+
+        # 8 - output confirmed tracks:
+        """
+        Only output tracks that are:
+        alive (not deleted).
+        stable (seen enough times).
+        recently updated (not ghosts from 10 frames ago).
+
+        In SORT-style logic, a track is confirmed if:
+        hits >= min_hits OR still in the first few frames
+        time_since_update == 0 (it was matched this frame)
+        
+        """
+        # 8 - output confirmed tracks:
+
+        outputs = []
+
+        for t in self.tracks:
+            # ONLY output tracks that have been seen enough times to be confirmed.
+            # The box drawn is t.get_state(), which is the Kalman Filter's prediction.
+            if t.hits >= self.min_hits:
+                bbox = t.get_state()
+                outputs.append(np.concatenate([bbox, [t.id]]))
+
+        return np.array(outputs)  # [x1, y1, x2, y2, track_id]
 
 
+# ------TEST----------
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-if __name__ == "__main__":
+"""if __name__ == "__main__":
     np.set_printoptions(precision=2, suppress=True)
 
-    print("=" * 60)
-    print("TEST 1: IOU sanity check")
-    print("=" * 60)
+    print("=" * 70)
+    print("TEST 1: IOU Function")
+    print("=" * 70)
     boxA = [0, 0, 10, 10]
     boxB = [5, 5, 15, 15]
     boxC = [20, 20, 30, 30]
+    print(f"IOU(overlap): {iou_calculation(boxA, boxB):.3f}")  # ~0.143
+    print(f"IOU(no overlap): {iou_calculation(boxA, boxC):.3f}")  # 0.0
 
-    print("IOU overlap:", iou_calculation(boxA, boxB))  # ~0.14
-    print("IOU no overlap:", iou_calculation(boxA, boxC))  # 0.0
+    print("\n" + "=" * 70)
+    print("TEST 2: Single Tracker Lifecycle")
+    print("=" * 70)
+    trk = Tracker([10, 20, 20, 30])
+    print(f"Initial - ID:{trk.id}, bbox:{trk.get_state()}")
 
-    print("\n" + "=" * 60)
-    print("TEST 2: Tracker lifecycle")
-    print("=" * 60)
+    pred1 = trk.predict()
+    print(f"Frame 1 (predict) - bbox:{pred1}, time_since:{trk.time_since_update}")
 
-    # Initial detection
-    initial_bbox = [10, 20, 20, 30]
-    trk = tracker(initial_bbox)
+    trk.update([12, 22, 22, 32])
+    print(f"Frame 2 (update) - bbox:{trk.get_state()}, hits:{trk.hits}")
+    pred2 = trk.predict()
+    print(f"Frame 3 (predict) - bbox:{pred2} (should predict forward motion)")
 
-    print(f"Tracker ID: {trk.id}")
-    print("Initial state:", trk.kf.x.flatten())
-    print(
-        "age:",
-        trk.age,
-        "hits:",
-        trk.hits,
-        "hit_streak:",
-        trk.hit_streak,
-        "time_since_update:",
-        trk.time_since_update,
-    )
+    print("\n" + "=" * 70)
+    print("TEST 3: Multi-Object Tracking")
+    print("=" * 70)
 
-    print("\n--- Frame 1: predict only (missed detection) ---")
-    trk.predict()
-    print("State:", trk.kf.x.flatten())
-    print(
-        "age:",
-        trk.age,
-        "hits:",
-        trk.hits,
-        "hit_streak:",
-        trk.hit_streak,
-        "time_since_update:",
-        trk.time_since_update,
-    )
+    tracker_mgr = TrackerManager(max_age=3, min_hits=1, iou_threshold=0.3)
 
-    print("\n--- Frame 2: predict + update (detected) ---")
-    detection = [12, 22, 22, 32]  # object moved slightly
-    trk.predict()
-    trk.update(detection)
-    print("State:", trk.kf.x.flatten())
-    print(
-        "age:",
-        trk.age,
-        "hits:",
-        trk.hits,
-        "hit_streak:",
-        trk.hit_streak,
-        "time_since_update:",
-        trk.time_since_update,
-    )
+    # Frame 1: Two objects appear
+    dets1 = [[10, 10, 50, 50], [100, 100, 150, 150]]
+    result1 = tracker_mgr.update(dets1)
+    print(f"Frame 1: {len(result1)} confirmed tracks")
+    print(result1)
 
-    print("\n--- Frame 3: predict only (missed again) ---")
-    trk.predict()
-    print("State:", trk.kf.x.flatten())
-    print(
-        "age:",
-        trk.age,
-        "hits:",
-        trk.hits,
-        "hit_streak:",
-        trk.hit_streak,
-        "time_since_update:",
-        trk.time_since_update,
-    )
+    # Frame 2: Objects move
+    dets2 = [[12, 12, 52, 52], [102, 102, 152, 152]]
+    result2 = tracker_mgr.update(dets2)
+    print(f"\nFrame 2: {len(result2)} confirmed tracks (IDs should be consistent)")
+    print(result2)
 
-    print("\n" + "=" * 60)
-    print("TEST COMPLETE")
-    print("=" * 60)
+    # Frame 3: One object disappears
+    dets3 = [[14, 14, 54, 54]]
+    result3 = tracker_mgr.update(dets3)
+    print(f"\nFrame 3: {len(result3)} confirmed tracks (one missing)")
+    print(result3)
+
+    # Frame 4-6: First object still there, second still missing
+    for i in range(4, 7):
+        dets = [[14 + 2 * i, 14 + 2 * i, 54 + 2 * i, 54 + 2 * i]]
+        result = tracker_mgr.update(dets)
+        print(
+            f"\nFrame {i}: {len(result)} tracks, total alive: {len(tracker_mgr.tracks)}"
+        )
+
+    print("\n" + "=" * 70)
+    print("ALL TESTS COMPLETE ✓")
+    print("=" * 70)"""
